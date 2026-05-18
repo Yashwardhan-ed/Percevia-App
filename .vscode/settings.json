@@ -1,0 +1,12 @@
+{
+    "cmake.sourceDirectory": "C:/Users/tusha/Desktop/CrazyProjects/percevia/linux",
+    "gradle.validation": false,
+    "java.help.shareDiagnostics": false,
+    "[gradle]": {
+        "editor.defaultFormatter": null
+    },
+    "[groovy]": {
+        "editor.defaultFormatter": null
+    },
+    "redhat.telemetry.enabled": false
+}
