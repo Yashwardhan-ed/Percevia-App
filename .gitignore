@@ -60,3 +60,13 @@ app.*.map.json
 /models_local/
 *.litertlm
 /gemma/
+
+# Tooling / scratch / non-release artifacts (kept out of the public repo)
+/.claude/
+/Reports/
+/PROJECT_DESCRIPTION.md
+/cam_arduino.ino
+/vibration.ino
+/convert_gemma_to_tflite.py
+/create_facenet_model.py
+/download_facenet_model.py

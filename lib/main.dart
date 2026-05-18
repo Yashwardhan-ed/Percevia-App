@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart' show kDebugMode;
 
 import 'package:camera/camera.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
@@ -13,7 +14,6 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
 import 'package:speech_to_text/speech_to_text.dart' as stt;
-import 'package:soundpool/soundpool.dart';
 import 'screens/manage_registrations_screen.dart';
 import 'screens/saved_responses_screen.dart';
 import 'screens/current_context_screen.dart';
@@ -27,6 +27,7 @@ import 'services/saved_response_service.dart';
 import 'services/text_recognition_service.dart';
 import 'services/accelerometer_service.dart';
 import 'services/gemini_first_fallback_provider.dart';
+import 'services/gemma_local_service.dart';
 import 'services/llm_provider.dart';
 import 'package:percevia/models/face_data.dart';
 import 'package:percevia/models/saved_response.dart';
@@ -728,22 +729,29 @@ class _PerceviaHomePageState extends State<PerceviaHomePage>
 
   final FlutterTts flutterTts = FlutterTts();
   final FlutterTts _objectGridTts = FlutterTts();
-  final LlmProvider _llmProvider = GeminiFirstFallbackProvider();
+  final GeminiFirstFallbackProvider _llmProvider = GeminiFirstFallbackProvider();
   // ignore: unused_field
   LlmRoutingMode _llmRoutingMode = LlmRoutingMode.localOnly;
   // ignore: unused_field
   bool _isGemmaReady = false;
   bool _isGemmaInitInProgress = false;
   String? _gemmaInitError;
+  // Gemma model download flow. The model (~2.5 GB) is fetched from a public
+  // HuggingFace mirror on first run rather than side-loaded over adb.
+  bool _modelMissing = false;
+  bool _isDownloadingModel = false;
+  int _downloadReceived = 0;
+  int _downloadTotal = 0;
+  // Dismiss only hides the card for the current run; it re-appears on every
+  // launch while the model is absent (state resets each process start).
+  bool _gemmaCardDismissed = false;
+  // Set when on cellular: the user must tap Download a second time to confirm
+  // the metered ~2.5 GB transfer.
+  bool _awaitingCellularConfirm = false;
+  int _lastSpokenProgressPercent = -1;
   late http.Client _httpClient;
   final stt.SpeechToText _speechToText = stt.SpeechToText();
   bool _isSpeechAvailable = false;
-  // Preloaded "mic is now listening" earcon (rising chime, like a keyboard /
-  // assistant voice-input cue). Loaded once and reused; the cue must fire the
-  // instant the mic goes hot, so it can't tolerate first-play decode latency.
-  Soundpool? _earconPool;
-  int? _earconSoundId;
-  Future<void>? _earconLoad;
   bool _speechInitInProgress = false;
   bool _isListening = false;
   bool _isLoadingProcessing = false;
@@ -972,17 +980,96 @@ class _PerceviaHomePageState extends State<PerceviaHomePage>
     // UI is already interactive when it starts.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       Future.delayed(const Duration(milliseconds: 800), () {
-        if (mounted) unawaited(_warmUpGemma());
+        if (mounted) unawaited(_initLlmRouting());
       });
     });
     unawaited(Perf.mem('startup (initState)'));
   }
 
+  /// Decides the LLM routing at launch.
+  ///
+  /// * Model already downloaded → warm Gemma and use it exclusively.
+  /// * Model absent + online → stay on Gemini for the free request budget;
+  ///   no prompt yet.
+  /// * Model absent + offline → Gemini is unreachable, so prompt the download
+  ///   immediately.
+  Future<void> _initLlmRouting() async {
+    _llmProvider.onGemmaRequired = _handleGemmaRequired;
+
+    if (await GemmaLocalService.instance.isModelPresent()) {
+      await _warmUpGemma();
+      return;
+    }
+
+    try {
+      // Safe with no local model: only the remote provider is initialized.
+      await _llmProvider.initialize();
+    } catch (e) {
+      debugPrint('[LLM] remote init failed: $e');
+    }
+
+    if (!await _hasConnectivity() && mounted) {
+      _promptGemmaDownload(GemmaNeedReason.geminiUnavailable, offline: true);
+    }
+  }
+
+  Future<bool> _hasConnectivity() async {
+    try {
+      final results = await Connectivity().checkConnectivity();
+      return results.any((c) => c != ConnectivityResult.none);
+    } catch (_) {
+      // If we can't tell, assume online and let Gemini try.
+      return true;
+    }
+  }
+
+  /// Provider hook: Gemma is needed but not on the device. Only the two
+  /// conditions the product wants — offline, or the Gemini budget spent —
+  /// surface the download prompt.
+  Future<void> _handleGemmaRequired(GemmaNeedReason reason) async {
+    if (_isDownloadingModel) return;
+    if (await GemmaLocalService.instance.isModelPresent()) return;
+
+    if (reason == GemmaNeedReason.geminiUnavailable) {
+      // A Gemini call failed: only treat this as a download trigger when the
+      // device is actually offline (a transient online error shouldn't push
+      // a 2.5 GB download on the user).
+      if (await _hasConnectivity()) return;
+      _promptGemmaDownload(reason, offline: true);
+      return;
+    }
+    _promptGemmaDownload(reason, offline: false);
+  }
+
+  void _promptGemmaDownload(GemmaNeedReason reason, {required bool offline}) {
+    if (!mounted) return;
+    // Already prompting and not dismissed — don't repeat the announcement.
+    if (_modelMissing && !_gemmaCardDismissed && !_isDownloadingModel) return;
+
+    setState(() {
+      _modelMissing = true;
+      _gemmaCardDismissed = false;
+      _isGemmaReady = false;
+    });
+    final why = offline
+        ? 'You are offline, so the online assistant is unavailable.'
+        : 'You have used your free online requests.';
+    _speak('$why Percevia can keep working with its on-device AI model, '
+        'about 2.5 gigabytes. Double tap Download model to begin.');
+  }
+
   Future<void> _warmUpGemma({bool userInitiated = false}) async {
-    if (_isGemmaInitInProgress) return;
+    if (_isGemmaInitInProgress || _isDownloadingModel) return;
+
+    // The download flow owns the missing-model prompt; if the file isn't here
+    // yet there is nothing to warm.
+    final present = await GemmaLocalService.instance.isModelPresent();
+    if (!present) return;
+
     if (mounted) {
       setState(() {
         _isGemmaInitInProgress = true;
+        _modelMissing = false;
         if (userInitiated) _gemmaInitError = null;
       });
     }
@@ -1009,6 +1096,104 @@ class _PerceviaHomePageState extends State<PerceviaHomePage>
         });
       }
     }
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes <= 0) return '0 MB';
+    const gb = 1024 * 1024 * 1024;
+    const mb = 1024 * 1024;
+    if (bytes >= gb) return '${(bytes / gb).toStringAsFixed(1)} GB';
+    return '${(bytes / mb).toStringAsFixed(0)} MB';
+  }
+
+  Future<bool> _isOnCellular() async {
+    try {
+      final results = await Connectivity().checkConnectivity();
+      final hasWifi = results.contains(ConnectivityResult.wifi) ||
+          results.contains(ConnectivityResult.ethernet);
+      final hasMobile = results.contains(ConnectivityResult.mobile);
+      return hasMobile && !hasWifi;
+    } catch (_) {
+      // If we can't tell, don't block the download behind a false warning.
+      return false;
+    }
+  }
+
+  Future<void> _startModelDownload() async {
+    if (_isDownloadingModel) return;
+
+    if (!_awaitingCellularConfirm && await _isOnCellular()) {
+      if (!mounted) return;
+      setState(() => _awaitingCellularConfirm = true);
+      _speak('You are on mobile data. This download is about 2.5 gigabytes '
+          'and may use your data allowance. Double tap Download again to '
+          'continue, or Dismiss to wait for Wi-Fi.');
+      return;
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _awaitingCellularConfirm = false;
+      _isDownloadingModel = true;
+      _gemmaCardDismissed = false;
+      _gemmaInitError = null;
+      _downloadReceived = 0;
+      _downloadTotal = 0;
+      _lastSpokenProgressPercent = -1;
+    });
+    _speak('Downloading the AI model. This can take several minutes. '
+        'You can keep using the rest of the app.');
+
+    try {
+      await GemmaLocalService.instance.downloadModel(
+        onProgress: (received, total) {
+          if (!mounted) return;
+          setState(() {
+            _downloadReceived = received;
+            _downloadTotal = total;
+          });
+          if (total > 0) {
+            final percent = ((received / total) * 100).floor();
+            // Speak only at 25 % milestones so the announcements don't
+            // overwhelm a screen-reader user.
+            final milestone = (percent ~/ 25) * 25;
+            if (milestone > _lastSpokenProgressPercent && milestone > 0) {
+              _lastSpokenProgressPercent = milestone;
+              if (milestone < 100) _speak('Model download $milestone percent.');
+            }
+          }
+        },
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _isDownloadingModel = false;
+        _modelMissing = false;
+      });
+      _speak('Model downloaded. Setting it up now.');
+      await _warmUpGemma(userInitiated: true);
+      if (mounted && _isGemmaReady) {
+        _speak('The AI model is ready.');
+      }
+    } on ModelDownloadCancelled {
+      if (!mounted) return;
+      setState(() => _isDownloadingModel = false);
+      _speak('Download cancelled. You can resume it later.');
+    } catch (e) {
+      debugPrint('[GemmaLocal] Model download failed: $e');
+      if (!mounted) return;
+      setState(() {
+        _isDownloadingModel = false;
+        _gemmaInitError = 'Download failed. Check your connection and retry.';
+      });
+      _speak('The model download failed. '
+          'Check your connection and double tap Retry.');
+    }
+  }
+
+  void _cancelModelDownload() {
+    GemmaLocalService.instance.cancelModelDownload();
+    _speak('Stopping download.');
   }
 
   Future<void> _setupTts() async {
@@ -1155,7 +1340,6 @@ class _PerceviaHomePageState extends State<PerceviaHomePage>
       _faceRecognitionService.dispose();
     }
     _depthService.dispose();
-    _earconPool?.dispose();
     super.dispose();
   }
 
@@ -2520,10 +2704,6 @@ Future<void> _reinitializeCamera([CameraDescription? camera]) async {
       await _stopObjectGridScan();
     }
 
-    // Pre-warm the listen-start chime now so it's decoded and ready by the
-    // time we reach the name-capture step (no first-play latency).
-    unawaited(_ensureEarconLoaded());
-
     try {
       // Speech is lazily initialized (and the mic permission is requested on
       // first use). The old code read the stale `_isSpeechAvailable` flag,
@@ -2637,41 +2817,10 @@ Future<void> _reinitializeCamera([CameraDescription? camera]) async {
     return avg;
   }
 
-  /// Loads the listen-start earcon into the sound pool once. Safe to call
-  /// repeatedly (and to pre-warm early) — the load runs at most once.
-  Future<void> _ensureEarconLoaded() {
-    return _earconLoad ??= () async {
-      try {
-        final pool = Soundpool.fromOptions(
-          options: const SoundpoolOptions(streamType: StreamType.notification),
-        );
-        final data = await rootBundle.load('assets/sounds/listen_start.wav');
-        final id = await pool.load(data);
-        _earconPool = pool;
-        _earconSoundId = id;
-      } catch (e) {
-        debugPrint('[Earcon] Load failed: $e');
-        // Leave _earconSoundId null; caller falls back to the system beep.
-        _earconLoad = null;
-      }
-    }();
-  }
-
-  /// Plays the "mic is now listening" cue: a heavy haptic plus the preloaded
-  /// rising chime. Falls back to the system alert tone if the chime isn't
-  /// available (load failed / still loading).
+  /// Plays the "mic is now listening" cue: a heavy haptic plus the system
+  /// alert tone.
   Future<void> _playListenStartCue() async {
     HapticFeedback.heavyImpact();
-    final pool = _earconPool;
-    final id = _earconSoundId;
-    if (pool != null && id != null) {
-      try {
-        await pool.play(id);
-        return;
-      } catch (e) {
-        debugPrint('[Earcon] Play failed: $e');
-      }
-    }
     await SystemSound.play(SystemSoundType.alert);
   }
 
@@ -4765,12 +4914,23 @@ $latestPrompt''';
                       ),
                     ),
                   ),
-                  if (_gemmaInitError != null)
-                    Positioned(
-                      left: 16,
-                      right: 16,
-                      top: _isUIVisible ? 72 : 16,
-                      child: _buildGemmaMissingCard(),
+                  if (_isDownloadingModel ||
+                      ((_modelMissing || _gemmaInitError != null) &&
+                          !_gemmaCardDismissed))
+                    // Anchored to the bottom so it never overlaps the
+                    // description/response box, which occupies the top of the
+                    // content area.
+                    Positioned.fill(
+                      child: SafeArea(
+                        child: Align(
+                          alignment: Alignment.bottomCenter,
+                          child: Padding(
+                            padding:
+                                const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                            child: _buildGemmaMissingCard(),
+                          ),
+                        ),
+                      ),
                     ),
                   // TalkBack-accessible "Stop reading" target. TalkBack
                   // swallows the body-level onDoubleTap, so the gesture
@@ -4810,85 +4970,155 @@ $latestPrompt''';
   }
 
   Widget _buildGemmaMissingCard() {
-    final details = _gemmaInitError ?? '';
-    final detailLines = details.split('\n');
-    final shortDetails = detailLines.take(6).join('\n');
+    String title;
+    String body;
+    Widget? progress;
+    String primaryLabel;
+    String primaryHint;
+    VoidCallback? onPrimary;
+    bool showDismiss = true;
+
+    if (_isDownloadingModel) {
+      final pct = _downloadTotal > 0
+          ? ((_downloadReceived / _downloadTotal) * 100).clamp(0, 100).floor()
+          : null;
+      title = 'Downloading AI model';
+      body = pct != null
+          ? '${_formatBytes(_downloadReceived)} of '
+              '${_formatBytes(_downloadTotal)}  •  $pct%'
+          : 'Downloaded ${_formatBytes(_downloadReceived)}…';
+      progress = LinearProgressIndicator(
+        value: pct != null ? pct / 100 : null,
+        minHeight: 8,
+        backgroundColor: Colors.white24,
+        valueColor: const AlwaysStoppedAnimation<Color>(Colors.white),
+      );
+      primaryLabel = 'Cancel download';
+      primaryHint = 'Double tap to stop downloading the model';
+      onPrimary = _cancelModelDownload;
+      showDismiss = false;
+    } else if (_awaitingCellularConfirm) {
+      title = 'Using mobile data';
+      body = 'The AI model is about 2.5 GB and you are on mobile data. '
+          'Download anyway?';
+      primaryLabel = 'Download anyway';
+      primaryHint = 'Double tap to download about 2.5 gigabytes over '
+          'mobile data';
+      onPrimary = () => unawaited(_startModelDownload());
+    } else if (_gemmaInitError != null) {
+      title = 'Download failed';
+      body = _gemmaInitError!;
+      primaryLabel = 'Retry';
+      primaryHint = 'Double tap to retry the model download';
+      onPrimary = () => unawaited(_startModelDownload());
+    } else {
+      title = 'AI model needed';
+      body = 'Percevia needs to download its AI model, about 2.5 GB. '
+          'This is a one-time setup.';
+      primaryLabel = 'Download model';
+      primaryHint = 'Double tap to download the AI model, about 2.5 '
+          'gigabytes';
+      onPrimary = () => unawaited(_startModelDownload());
+    }
+
+    final primaryButton = Semantics(
+      button: true,
+      label: primaryLabel,
+      hint: primaryHint,
+      child: SizedBox(
+        width: double.infinity,
+        child: ElevatedButton(
+          onPressed: onPrimary,
+          style: ElevatedButton.styleFrom(
+            backgroundColor: Colors.white,
+            foregroundColor: Colors.black,
+            padding: const EdgeInsets.symmetric(vertical: 14),
+          ),
+          child: Text(
+            primaryLabel,
+            style: GoogleFonts.inter(
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+      ),
+    );
 
     return Material(
       color: Colors.transparent,
-      child: Container(
-        decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.85),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: Colors.white, width: 1.5),
-        ),
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              'Gemma model not ready',
-              style: GoogleFonts.orbitron(
-                color: Colors.white,
-                fontSize: 18,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              'Run scripts/push_gemma_model.sh on the host, then tap Retry.',
-              style: GoogleFonts.inter(
-                color: Colors.white.withValues(alpha: 0.9),
-                fontSize: 14,
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-            if (shortDetails.isNotEmpty) ...[
-              const SizedBox(height: 10),
+      child: Semantics(
+        container: true,
+        child: Container(
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.88),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: Colors.white, width: 1.5),
+          ),
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
               Text(
-                shortDetails,
-                style: GoogleFonts.robotoMono(
-                  color: Colors.white.withValues(alpha: 0.75),
-                  fontSize: 11,
-                  height: 1.3,
+                title,
+                style: GoogleFonts.orbitron(
+                  color: Colors.white,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
                 ),
               ),
-            ],
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                ElevatedButton(
-                  onPressed: _isGemmaInitInProgress
-                      ? null
-                      : () => unawaited(_warmUpGemma(userInitiated: true)),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.white,
-                    foregroundColor: Colors.black,
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              const SizedBox(height: 8),
+              Semantics(
+                liveRegion: _isDownloadingModel,
+                child: Text(
+                  body,
+                  style: GoogleFonts.inter(
+                    color: Colors.white.withValues(alpha: 0.9),
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
                   ),
-                  child: _isGemmaInitInProgress
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: Colors.black,
-                          ),
-                        )
-                      : const Text('Retry'),
                 ),
-                const SizedBox(width: 12),
-                TextButton(
-                  onPressed: () {
-                    if (!mounted) return;
-                    setState(() => _gemmaInitError = null);
-                  },
-                  child: const Text('Dismiss'),
+              ),
+              if (progress != null) ...[
+                const SizedBox(height: 12),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(4),
+                  child: progress,
                 ),
               ],
-            ),
-          ],
+              const SizedBox(height: 14),
+              primaryButton,
+              if (showDismiss) ...[
+                const SizedBox(height: 4),
+                Semantics(
+                  button: true,
+                  label: 'Dismiss',
+                  hint: 'Double tap to hide this until the next launch',
+                  child: SizedBox(
+                    width: double.infinity,
+                    child: TextButton(
+                      onPressed: () {
+                        if (!mounted) return;
+                        setState(() {
+                          _gemmaCardDismissed = true;
+                          _awaitingCellularConfirm = false;
+                          _gemmaInitError = null;
+                        });
+                      },
+                      child: Text(
+                        'Dismiss',
+                        style: GoogleFonts.inter(
+                          color: Colors.white.withValues(alpha: 0.85),
+                          fontSize: 14,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
         ),
       ),
     );

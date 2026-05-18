@@ -50,7 +50,19 @@ text-labelled buttons, designed for non-visual use and for screen readers
 - An internet connection **on first launch only**, to download the AI model once.
 - A few GB of free storage for the on-device model.
 
-### Install from source
+### Install the APK (recommended)
+
+Most users should just install the prebuilt app — no developer tools needed:
+
+1. Open the **[Releases](https://github.com/Yashwardhan-ed/Percevia-App/releases)**
+   page of this repository.
+2. Under the latest release, expand **Assets** and download
+   **`app-release.apk`** onto your Android phone.
+3. Open the downloaded file. If prompted, allow installing apps from this
+   source (Android may call it "Install unknown apps") and continue.
+4. Launch **Percevia** and complete the one-time setup below.
+
+### Install from source (developers)
 
 1. Install the [Flutter SDK](https://docs.flutter.dev/get-started/install) and add it to your `PATH`.
 2. Clone this repository and open a terminal in the project root.

@@ -3,10 +3,20 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_gemma/flutter_gemma.dart';
+import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import 'perf_log.dart';
+
+/// Thrown by [GemmaLocalService.downloadModel] when the user cancels an
+/// in-flight download. The partial `.part` file is intentionally kept so the
+/// next attempt resumes from where it stopped.
+class ModelDownloadCancelled implements Exception {
+  const ModelDownloadCancelled();
+  @override
+  String toString() => 'ModelDownloadCancelled';
+}
 
 /// Shared local Gemma runtime used by all on-device LLM features.
 class GemmaLocalService {
@@ -20,8 +30,16 @@ class GemmaLocalService {
   // the Flutter asset bundle: at ~2.5 GB it exceeds Android APK packaging limits.
   static const String modelFileName = 'gemma-4-E2B-it.litertlm';
 
+  // Public HuggingFace mirror of the model. The repo is public (no token
+  // required) and the CDN honours HTTP Range requests, so downloads can be
+  // resumed after an interruption.
+  static const String modelDownloadUrl =
+      'https://huggingface.co/Yash-ed/gemma-4-E2B-it.litertlm/resolve/main/'
+      'gemma-4-E2B-it.litertlm?download=true';
+
   Future<void>? _initFuture;
   InferenceModel? _model;
+  bool _downloadCancelRequested = false;
 
   // Serializes every generation against the single native model. The
   // LiteRT-LM engine crashes hard (SIGSEGV in ThreadPool::RunWorker) if a
@@ -80,70 +98,144 @@ class GemmaLocalService {
     );
   }
 
-  /// Locates the on-device Gemma .litertlm file. Prefers the app documents dir
-  /// and copies from the app external files dir if needed.
-  /// Throws a [FileSystemException] with the expected push command if missing.
-  Future<String> _resolveModelFilePath() async {
+  /// The canonical on-device location the model is loaded from.
+  Future<File> _docsModelFile() async {
     final docsRoot = await getApplicationDocumentsDirectory();
-    final docsDir = Directory(p.join(docsRoot.path, 'models'));
-    final docsFile = File(p.join(docsDir.path, modelFileName));
+    return File(p.join(docsRoot.path, 'models', modelFileName));
+  }
 
-    if (await docsFile.exists()) {
-      debugPrint('[GemmaLocal] Loading model from ${docsFile.path}');
-      return docsFile.path;
-    }
+  /// Optional dev/side-load location (Android external app files dir). When a
+  /// model is staged here it is copied into the documents dir on first use.
+  Future<File?> _externalModelFile() async {
+    if (!Platform.isAndroid) return null;
+    final ext = await getExternalStorageDirectory();
+    if (ext == null) return null;
+    return File(p.join(ext.path, 'models', modelFileName));
+  }
 
-    Directory? externalDir;
-    File? externalFile;
-    if (Platform.isAndroid) {
-      final ext = await getExternalStorageDirectory();
-      if (ext != null) {
-        externalDir = Directory(p.join(ext.path, 'models'));
-        externalFile = File(p.join(externalDir.path, modelFileName));
-      }
-    }
+  /// Non-throwing presence check used to decide whether to offer the in-app
+  /// download. If a side-loaded copy exists in the external dir it is promoted
+  /// into the documents dir so subsequent loads are fast.
+  Future<bool> isModelPresent() async {
+    final docsFile = await _docsModelFile();
+    if (await docsFile.exists() && await docsFile.length() > 0) return true;
 
-    if (externalFile != null && await externalFile.exists()) {
+    final externalFile = await _externalModelFile();
+    if (externalFile != null &&
+        await externalFile.exists() &&
+        await externalFile.length() > 0) {
       await _copyModelToDocuments(source: externalFile, target: docsFile);
+      return true;
+    }
+    return false;
+  }
+
+  /// Locates the on-device Gemma .litertlm file. Prefers the app documents dir
+  /// and copies from the app external files dir if needed. Throws a
+  /// [FileSystemException] if the model has not been downloaded yet.
+  Future<String> _resolveModelFilePath() async {
+    final docsFile = await _docsModelFile();
+    if (await isModelPresent()) {
       debugPrint('[GemmaLocal] Loading model from ${docsFile.path}');
       return docsFile.path;
     }
+    throw FileSystemException(
+      'Gemma model not downloaded yet. Use the in-app download prompt.',
+      docsFile.path,
+    );
+  }
 
-    final searched = <String>[docsFile.path];
-    if (externalFile != null) searched.add(externalFile.path);
-    final searchedText = searched.join('\n  ');
+  /// Requests cancellation of an in-flight [downloadModel]. The partial file
+  /// is kept so the next call resumes.
+  void cancelModelDownload() => _downloadCancelRequested = true;
 
-    final instructions = StringBuffer('Gemma model not found on device.\n')
-      ..writeln('Searched:')
-      ..writeln('  $searchedText')
-      ..writeln();
+  /// Streams the model from [modelDownloadUrl] into the documents dir.
+  ///
+  /// Downloads into a `.part` sidecar and atomically renames on completion, so
+  /// an interrupted run never leaves a truncated file at the load path. If a
+  /// `.part` already exists the download resumes via an HTTP Range request.
+  /// [onProgress] reports `(received, total)` bytes; `total` is 0 if the
+  /// server does not advertise a length. Throws [ModelDownloadCancelled] if
+  /// [cancelModelDownload] is called mid-flight.
+  Future<void> downloadModel({
+    required void Function(int received, int total) onProgress,
+  }) async {
+    _downloadCancelRequested = false;
 
-    if (Platform.isAndroid) {
-      final externalPath = externalDir?.path ??
-          '/sdcard/Android/data/<package>/files/models';
-      instructions
-        ..writeln('Dev helper:')
-        ..writeln('  scripts/push_gemma_model.sh')
-        ..writeln()
-        ..writeln('Manual adb:')
-        ..writeln('  adb shell mkdir -p $externalPath')
-        ..write('  adb push models_local/$modelFileName '
-            '$externalPath/$modelFileName');
-    } else if (Platform.isIOS) {
-      instructions
-        ..writeln('Push the file into the app sandbox via Finder:')
-        ..writeln('  1. Connect the device, open Finder, select the device')
-        ..writeln('  2. Click the "Files" tab and find Percevia')
-        ..writeln('  3. Drag models_local/$modelFileName into Percevia/models/')
-        ..writeln('     (UIFileSharingEnabled must be true in Info.plist)')
-        ..writeln()
-        ..write('Or use the Files app on the device under '
-            'On My iPhone > Percevia > models/.');
-    } else {
-      instructions.write('Place $modelFileName in:\n  ${docsFile.path}');
+    final target = await _docsModelFile();
+    if (await target.exists() && await target.length() > 0) return;
+    await target.parent.create(recursive: true);
+    final partFile = File('${target.path}.part');
+
+    var existing =
+        await partFile.exists() ? await partFile.length() : 0;
+
+    final client = http.Client();
+    IOSink? sink;
+    try {
+      final request = http.Request('GET', Uri.parse(modelDownloadUrl))
+        ..followRedirects = true;
+      if (existing > 0) request.headers['range'] = 'bytes=$existing-';
+
+      final response = await client.send(request);
+
+      if (existing > 0 && response.statusCode == 416) {
+        // Requested range is past the end: the `.part` already holds the
+        // whole file (a prior run finished downloading but died before the
+        // rename). Promote it as-is.
+        await response.stream.drain<void>();
+        onProgress(existing, existing);
+        await partFile.rename(target.path);
+        debugPrint('[GemmaLocal] Resumed completed model to ${target.path}');
+        return;
+      }
+
+      if (existing > 0 && response.statusCode == 200) {
+        // Server (or a redirect hop) ignored the Range header and is sending
+        // the whole file again — restart cleanly from byte 0.
+        existing = 0;
+      } else if (response.statusCode != 200 && response.statusCode != 206) {
+        throw HttpException(
+          'Model download failed: HTTP ${response.statusCode}',
+          uri: Uri.parse(modelDownloadUrl),
+        );
+      }
+
+      final total = existing + (response.contentLength ?? 0);
+      var received = existing;
+      onProgress(received, total);
+
+      final out = partFile.openWrite(
+        mode: existing > 0 ? FileMode.append : FileMode.write,
+      );
+      sink = out;
+
+      await for (final chunk in response.stream) {
+        if (_downloadCancelRequested) {
+          await out.flush();
+          await out.close();
+          sink = null;
+          throw const ModelDownloadCancelled();
+        }
+        out.add(chunk);
+        received += chunk.length;
+        onProgress(received, total);
+      }
+
+      await out.flush();
+      await out.close();
+      sink = null;
+
+      await partFile.rename(target.path);
+      debugPrint('[GemmaLocal] Model downloaded to ${target.path}');
+    } finally {
+      if (sink != null) {
+        try {
+          await sink.close();
+        } catch (_) {}
+      }
+      client.close();
     }
-
-    throw FileSystemException(instructions.toString());
   }
 
   Future<void> _copyModelToDocuments({
