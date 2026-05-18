@@ -1,6 +1,6 @@
 # Percevia
 
-**An offline-first AI companion that helps blind and visually impaired people understand the world around them — powered end to end by Gemma running on the device itself.**
+**An offline-first AI companion that helps blind and visually impaired people understand the world around  them — powered end to end by Gemma running on the device itself.**
 
 ## Overview
 
