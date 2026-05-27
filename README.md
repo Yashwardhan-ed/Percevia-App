@@ -71,7 +71,7 @@ Most users should just install the prebuilt app — no developer tools needed:
    ```bash
    flutter pub get
    ```
-
+   
 4. Put the app on a phone, either by running it on a connected device (USB
    debugging enabled) or by building an installable APK:
 
@@ -86,8 +86,8 @@ Most users should just install the prebuilt app — no developer tools needed:
 
 ### First launch (one-time setup)
 
-On the first run, Percevia **automatically downloads the on-device Gemma model
-and configures it for you** — there is nothing to copy, and no computer is
+On the first run, Percevia will either shift to gemini api for the first 2 tries(in case of direct link download) or **automatically downloads the on-device Gemma model
+and configures it for you**(in case of installing from source ,developers) — there is nothing to copy, and no computer is
 needed. This is a one-time download: keep the app open and connected to the
 internet until it finishes. After that, the app works **fully offline**.
 
